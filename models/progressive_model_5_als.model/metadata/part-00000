@@ -1,0 +1,1 @@
+{"class":"org.apache.spark.ml.recommendation.ALSModel","timestamp":1731338733744,"sparkVersion":"3.5.3","uid":"ALS_cbcd0e004d4e","paramMap":{"coldStartStrategy":"drop","blockSize":4096,"userCol":"CustomerID","itemCol":"StockCode"},"defaultParamMap":{"coldStartStrategy":"nan","blockSize":4096,"userCol":"user","predictionCol":"prediction","itemCol":"item"},"rank":10}
