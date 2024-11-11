@@ -1,60 +1,95 @@
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
 from pyspark.ml.clustering import KMeans
-from pyspark.ml.recommendation import ALS
-from pyspark.ml.classification import DecisionTreeClassifier
 from pyspark.ml.feature import VectorAssembler
 import os
 
-# Initialize Spark Session
-spark = SparkSession.builder \
-    .appName("KafkaSparkModelTraining") \
-    .getOrCreate()
+# Inisialisasi SparkSession
+spark = SparkSession.builder.appName("CustomerSegmentation") \
+        .config("spark.driver.memory", "8g") \
+        .config("spark.executor.memory", "8g") \
+        .getOrCreate()
 
-# Directory containing the batch datasets
-batch_data_dir = "./data"
-model_save_dir = "./models"
+# Direktori data dan model
+data_directory = "./data"
+model_directory = "./models"
 
-# Function to train KMeans, ALS, and Decision Tree models
-def train_models(data, model_save_dir, model_name_prefix):
-    assembler = VectorAssembler(inputCols=["Quantity", "Price"], outputCol="features")
-    data = assembler.transform(data)
+# Membuat direktori model jika belum ada
+if not os.path.exists(model_directory):
+    os.makedirs(model_directory)
 
-    # Train KMeans model
-    kmeans = KMeans().setK(3).setSeed(1)
-    kmeans_model = kmeans.fit(data)
-    kmeans_model.write().overwrite().save(f"{model_save_dir}/{model_name_prefix}_kmeans.model")
-    print(f"Saved KMeans model: {model_name_prefix}_kmeans.model")
+# Mendapatkan daftar file batch dan mengurutkannya
+batch_files = sorted(os.listdir(data_directory))
+total_batches = len(batch_files)
 
-    # Prepare data for ALS model
-    data = data.withColumnRenamed("Customer ID", "CustomerID")
-    data = data.withColumn("CustomerID", data["CustomerID"].cast("integer"))
-    data = data.withColumn("StockCode", data["StockCode"].cast("integer"))  # Cast StockCode to integer
+# Inisialisasi variabel
+accumulated_df = None
+model1_trained = False
+model2_trained = False
+model3_trained = False
 
-    # Filter out rows with null values in CustomerID or StockCode
-    data_filtered = data.dropna(subset=["CustomerID", "StockCode"])
+# Menentukan threshold batch untuk setiap model
+model1_threshold = total_batches // 3
+model2_threshold = (total_batches * 2) // 3
+model3_threshold = total_batches
 
-    # Train ALS recommendation model
-    als = ALS(userCol="CustomerID", itemCol="StockCode", ratingCol="Quantity", implicitPrefs=True, coldStartStrategy="drop")
-    als_model = als.fit(data_filtered)
-    als_model.write().overwrite().save(f"{model_save_dir}/{model_name_prefix}_als.model")
-    print(f"Saved ALS model: {model_name_prefix}_als.model")
 
-    # Train Decision Tree classifier
-    data = data.withColumn("label", (data["Quantity"] > 0).cast("int"))
-    dt = DecisionTreeClassifier(labelCol="label", featuresCol="features")
-    dt_model = dt.fit(data)
-    dt_model.write().overwrite().save(f"{model_save_dir}/{model_name_prefix}_dt.model")
-    print(f"Saved Decision Tree model: {model_name_prefix}_dt.model")
+def train_model(dataframe, model_name):
+    # Menghapus data yang tidak memiliki Customer ID
+    df = dataframe.na.drop(subset=["Customer ID"])
 
-# Load and train on progressively larger batches
-batch_files = sorted(os.listdir(batch_data_dir))
+    # Konversi tipe data
+    df = df.withColumn("Quantity", col("Quantity").cast("float"))
+    df = df.withColumn("Price", col("Price").cast("float"))
+    df = df.withColumn("InvoiceDate", to_timestamp("InvoiceDate", "yyyy-MM-dd HH:mm:ss"))
 
-data_accumulated = None
-for i, batch_file in enumerate(batch_files, 1):
-    batch_path = os.path.join(batch_data_dir, batch_file)
-    data = spark.read.json(batch_path)
+    # Menghitung TotalAmount
+    df = df.withColumn("TotalAmount", col("Quantity") * col("Price"))
 
-    data_accumulated = data if data_accumulated is None else data_accumulated.union(data)
-    train_models(data_accumulated, model_save_dir, f"progressive_model_{i}")
+    # Menghitung fitur per Customer ID
+    customer_df = df.groupBy("Customer ID").agg(
+        sum("Quantity").alias("TotalQuantity"),
+        sum("TotalAmount").alias("TotalAmount"),
+        countDistinct("Invoice").alias("NumInvoices")
+    )
 
+    # Membuat fitur vektor
+    assembler = VectorAssembler(inputCols=["TotalQuantity", "TotalAmount", "NumInvoices"], outputCol="features")
+    feature_df = assembler.transform(customer_df)
+
+    # Training model KMeans
+    kmeans = KMeans(featuresCol="features", predictionCol="prediction", k=4, seed=1)
+    model = kmeans.fit(feature_df)
+
+    # Menyimpan model
+    model.save(os.path.join(model_directory, model_name))
+    print(f"{model_name} telah dilatih dan disimpan.")
+
+
+# Membaca batch data dan melakukan training model sesuai threshold
+for idx, batch_file in enumerate(batch_files):
+    batch_path = os.path.join(data_directory, batch_file)
+    batch_df = spark.read.json(batch_path)
+
+    if accumulated_df is None:
+        accumulated_df = batch_df
+    else:
+        accumulated_df = accumulated_df.union(batch_df)
+
+    # Training Model 1
+    if not model1_trained and idx + 1 >= model1_threshold:
+        train_model(accumulated_df, "model1")
+        model1_trained = True
+
+    # Training Model 2
+    if not model2_trained and idx + 1 >= model2_threshold:
+        train_model(accumulated_df, "model2")
+        model2_trained = True
+
+    # Training Model 3
+    if not model3_trained and idx + 1 >= model3_threshold:
+        train_model(accumulated_df, "model3")
+        model3_trained = True
+
+# Menghentikan SparkSession
 spark.stop()
